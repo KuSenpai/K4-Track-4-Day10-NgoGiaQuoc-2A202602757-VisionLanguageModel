@@ -13,6 +13,7 @@ Môi trường chạy: Kaggle Notebook, GPU T4 (dùng 1 card), transformers 5.19
 | E3 | + LoRA ViT | 148,426,752 | 8.73 | 51.5 | **0.447** | 0.407–0.490 | 0.86 | 0.326 | 0.366 | 0.696 |
 | E4 | coord_scale = norm1000 (chính là E3, chấm lại) | 148,426,752 | 8.73 | 51.5 | 0.447 | 0.407–0.490 | 0.86 | 0.326 | 0.366 | 0.696 |
 | E4 | coord_scale = pixel (E3, đổi nhãn + prompt + `--coord pixel`) | 148,426,752 | 8.70 | 51.0 | 0.392 | 0.350–0.435 | 0.94 | 0.274 | 0.304 | 0.625 |
+| E5 | GRPO 60 bước từ E3, reward IoU (bonus) | 39,321,600 | 8.03 | 45.7 | 0.452 | 0.411–0.493 | 0.77 | 0.339 | 0.367 | 0.699 |
 
 `parse_valid_rate`: E0 0.926 · E1 0.994 · E2, E3, E4 1.000. Mean IoU của các cặp khớp: 0.603 (E0) → 0.677 (E1) → 0.682 (E2) → 0.693 (E3).
 VRAM đỉnh đo bằng `torch.cuda.max_memory_allocated()` từ lúc nạp model đến hết 300 bước; thời gian chỉ tính vòng huấn luyện (chưa tính suy luận test ≈ 15 phút mỗi setup).
@@ -117,6 +118,33 @@ Thang pixel kém hơn 0.055 F1, và **cả ba lớp đều giảm** (0.05–0.07
 
 **Mức tin cậy**: hai khoảng CI95 chồng nhau ở đoạn 0.407–0.435, nên ở mức 95% tôi **chưa thể khẳng định** pixel kém hơn. Hướng giảm nhất quán ở cả 3 lớp là bằng chứng gợi ý, không phải kết luận chắc chắn. Muốn chắc chắn cần chạy nhiều seed, hoặc dùng tập test lớn hơn và bootstrap theo phiên. Kết luận an toàn: không có lý do để rời thang 0–1000 mặc định.
 
+## E5 (bonus) — GRPO với reward IoU
+
+**Thiết lập** (notebook `lab_day10_e5.ipynb`, Kaggle run 358086382, `trl==1.9.2`, không dùng vLLM):
+- Khởi tạo từ adapter E3. Chỉ cập nhật LoRA của LLM và ViT (39,32M tham số = 33,03M + 6,29M); projector của E3 được nạp lại nhưng đóng băng.
+- Siêu tham số: `num_generations=4`, `max_completion_length=128`, 60 bước, lr 5e-6, `beta=0` (không dùng KL), mỗi bước 2 ảnh × 4 lần sinh, fp16.
+- Reward: `0.2·valid + 0.8·ΣIoU(cặp khớp cùng lớp, IoU ≥ 0.5) / max(n_gt, n_pred, 1)`. Hàm này được viết và test trước khi chạy GRPO; 6 test pass (hoàn hảo, JSON hỏng, sai lớp, thừa box, rỗng, box khổng lồ).
+- Ảnh huấn luyện lấy ngẫu nhiên 160 ảnh từ 1.280/1.422 ảnh train có đáp án ngắn hơn 120 token. Mục đích là để đáp án đúng luôn vừa trong 128 token, tránh reward phạt oan khi JSON bị cắt.
+- Log đầy đủ ở `report/e5_grpo_log.json`, phân tích hành vi ở `report/e5_analysis.json`.
+
+**Log GRPO** (mỗi 5 bước): reward trung bình theo batch dao động 0.36–0.51 (bước 5: 0.451, bước 30: 0.359, bước 60: 0.505). Trung bình 3 lần log đầu là 0.437, 3 lần cuối là 0.453. Như vậy **không có xu hướng tăng rõ**: nhiễu giữa các batch (reward_std 0.15–0.23) lớn hơn mức thay đổi. Có 0–15% nhóm 4 completion cho reward giống hệt nhau (`frac_reward_zero_std`); các nhóm này có advantage bằng 0 nên không đóng góp gradient. Độ dài completion ổn định ở 47–60 token, tỉ lệ bị cắt ≤ 6%. Mỗi bước mất khoảng 45 giây; tổng thời gian train 45,7 phút, VRAM đỉnh 8,03 GB.
+
+**Có reward hacking không?** So sánh hành vi trên 311 ảnh test (`e5_analysis.json`):
+
+| | Output `[]` | JSON hỏng | Box/ảnh | Box > 25% khung | Reward TB trên test |
+|---|---|---|---|---|---|
+| GT | – | – | 1.87 | – | – |
+| E3 (SFT) | 0 | 0 | 1.65 | 0 | 0.4745 |
+| E5 (GRPO) | 0 | 0 | 1.54 | 0 | 0.4727 |
+
+**Không thấy reward hacking.** Có hai kiểu hacking dễ xảy ra với reward này, và đều không xuất hiện:
+- Trả `[]` để ăn chắc 0.2 điểm định dạng (hoặc 1.0 điểm với ảnh không có box): không có output `[]` nào.
+- Vẽ box khổng lồ để "trùm" GT: không có box nào lớn hơn 25% khung hình, vì box khổng lồ có IoU < 0.5 nên reward không thưởng.
+
+Thay đổi duy nhất là model trở nên **thận trọng hơn một chút**: số box mỗi ảnh giảm từ 1.65 xuống 1.54. Điều này khớp với mẫu số `max(n_gt, n_pred)` của reward, vốn phạt box thừa. Kết quả là precision tăng (0.479 → 0.502), FP/ảnh giảm (0.86 → 0.77), còn recall giảm nhẹ (0.420 → 0.412).
+
+**So với SFT (E3)**: F1 tăng từ 0.447 (CI95 0.407–0.490) lên **0.452 (CI95 0.411–0.493)**, tức chỉ +0.005, và hai khoảng CI gần như trùng nhau hoàn toàn. Reward trung bình trên test cũng không đổi (0.4745 so với 0.4727). Vì vậy **GRPO không cải thiện có ý nghĩa thống kê** so với SFT. Nguyên nhân hợp lý: 60 bước × 2 ảnh chỉ là 120 ảnh với lr 5e-6 (giảm dần về 0), quá ít so với SFT 300 bước × 8 ảnh. Thêm vào đó, mỗi nhóm chỉ có 4 completion nên phương sai advantage lớn. Muốn đo được hiệu ứng của GRPO cần nhiều bước hơn, nhiều lần sinh hơn cho mỗi prompt (vLLM sẽ giúp), và có thể bật lại KL (`beta > 0`) để giữ model gần SFT khi chạy lâu.
+
 ## Nhìn lại
 
 - **Ba lỗi môi trường mà công cụ chấm không bắt được**, vì cả ba đều không làm hỏng JSON hay file bằng chứng:
@@ -127,4 +155,4 @@ Thang pixel kém hơn 0.055 F1, và **cả ba lớp đều giảm** (0.05–0.07
   Smoke test (2 bước với setup nặng nhất E3) chạy trước khi train thật đã bắt được cả ba lỗi.
 - **Lỗi dữ liệu**: 1 nhãn train bị parser của trọng tài từ chối vì box quá nhỏ, sau khi làm tròn về thang 0–1000 thì x1 = x2 (suy biến). Lỗi này không ảnh hưởng đáng kể nhưng cho thấy độ phân giải 0–1000 không đủ cho những box rất nhỏ.
 - **Điều tôi chưa hiểu hết**: vì sao chỉ *bias* của projector bị kẹt `grad_dtype` fp16 còn weight thì không. Tôi cũng chưa định lượng được tác động của việc không mask loss, vì không chạy thử biến thể đó.
-- **E5 (GRPO)**: mới viết hàm reward IoU và 6 test (hoàn hảo, JSON hỏng, sai lớp, thừa box, rỗng, box khổng lồ); test đã pass trên Kaggle. Chưa chạy GRPO nên không nhận phần điểm "có log" và "phân tích reward hacking".
+- **E5 (GRPO)**: trl 1.9.2 tự ép tham số LoRA của model 4-bit về bf16 (T4 không hỗ trợ bf16) và mặc định bật `bf16`. Tôi phải đặt `fp16=True, bf16=False` rồi ép LoRA về fp32 sau khi khởi tạo trainer. Thanh tiến trình của Trainer là HTML nên không ghi ra log của bản chạy commit; tôi lưu `log_history` ra file để có bằng chứng.
